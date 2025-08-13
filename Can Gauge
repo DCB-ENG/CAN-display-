@@ -1,0 +1,222 @@
+#include <SPI.h>
+#include <mcp_can.h>
+#include <U8g2lib.h>
+#include <math.h>
+
+// --- CAN (MCP2515) ---
+MCP_CAN CAN(10);              // CS pin
+#define CAN0_INT 2            // INT pin
+
+// Haltech CAN IDs
+#define CAN_ID_OIL   0x361    // bytes 2-3: kPa(abs)*0.1
+#define CAN_ID_RPMMP 0x360    // bytes 0-1: rpm, 2-3: MAP kPa(abs)*0.1
+#define CAN_ID_LAMB  0x368    // bytes 0-1: lambda * 1000
+
+// --- Display (U8x8: fast text mode) ---
+U8X8_SH1106_128X64_NONAME_HW_I2C u8x8(U8X8_PIN_NONE);
+
+// --- One Button (short = page, long = mute) ---
+#define BTN         3           // to GND (INPUT_PULLUP)
+#define DEBOUNCE_MS 150UL
+#define LONG_MS     600UL       // long press threshold
+#define MUTE_MS     10000UL     // 10 s
+
+// --- Pages ---
+#define PAGE_OIL   0
+#define PAGE_MAP   1
+#define PAGE_LAMB  2
+#define PAGE_RPM   3
+#define NUM_PAGES  4
+uint8_t currentPage = PAGE_OIL;
+
+// --- Config ---
+#define OIL_P_MIN_PSI     14.5f     // alarm ON below this
+#define OIL_P_CLEAR_PSI   16.0f     // alarm OFF above this (hysteresis)
+#define FLASH_INTERVAL    500UL     // ms
+#define DISPLAY_INTERVAL  200UL     // ms (5 Hz)
+#define SMOOTH_ALPHA      0.20f     // EMA smoothing factor
+
+// Quantization (reduce flicker)
+#define STEP_OIL   0.2f     // PSI
+#define STEP_MAP   0.2f     // PSI (gauge)
+#define STEP_LAMB  0.02f    // lambda
+#define STEP_RPM   10       // rpm
+
+// --- State (raw + filtered + shown) ---
+float oilPsiRaw = -1.0f,  oilPsiFilt = 0.0f,  oilShown = -999.0f;
+float mapPsiRaw = -1.0f,  mapPsiFilt = 0.0f,  mapPsiShown = -999.0f;  // MAP in PSI (gauge)
+float lambRaw   = -1.0f,  lambFilt   = 0.0f,  lambShown   = -999.0f;
+uint16_t rpmRaw = 0,      rpmShown   = 0;
+
+// Alert + timing
+bool alertActive = false, flashOn = false;
+unsigned long lastFlashToggle = 0;
+unsigned long lastDisplayUpdate = 0;
+
+// Button state
+bool btnLast = HIGH;
+unsigned long btnChangeAt = 0;
+bool btnPressed = false;
+unsigned long btnPressAt = 0;
+
+// Mute
+unsigned long muteUntil = 0;
+
+// ---------- helpers ----------
+uint8_t centerCol(const char* s) {
+  int8_t col = (16 - (int)strlen(s)) / 2;
+  return (col < 0) ? 0 : (uint8_t)col;
+}
+uint8_t centerCol2x(const char* s) {
+  int8_t col = (16 - ((int)strlen(s) * 2)) / 2;
+  return (col < 0) ? 0 : (uint8_t)col;
+}
+float quantizeF(float v, float step) { return (step <= 0) ? v : roundf(v / step) * step; }
+bool changedF(float a, float b, float step) { return fabs(a - b) >= step; }
+
+void drawCenteredLabel(const char* label) {
+  u8x8.clearLine(0);
+  u8x8.drawString(centerCol(label), 0, label);
+}
+void drawCenteredValue2x(const char* value) {
+  u8x8.clearLine(3);
+  u8x8.clearLine(4);
+  u8x8.draw2x2String(centerCol2x(value), 3, value);
+}
+// -----------------------------
+
+void setup() {
+  u8x8.begin();
+  u8x8.setBusClock(400000);     // fast I2C for cleaner updates
+  u8x8.setPowerSave(0);
+  u8x8.setFont(u8x8_font_chroma48medium8_r);
+  u8x8.clearDisplay();
+
+  pinMode(BTN, INPUT_PULLUP);
+
+  // CAN (change to MCP_16MHZ if your MCP2515 is 16 MHz)
+  if (CAN.begin(MCP_ANY, CAN_1000KBPS, MCP_8MHZ) != CAN_OK) {
+    u8x8.drawString(0, 3, "CAN FAIL");
+    while (1) {}
+  }
+  CAN.setMode(MCP_NORMAL);
+  pinMode(CAN0_INT, INPUT);
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  // 1) Drain all CAN frames fast
+  while (!digitalRead(CAN0_INT)) {
+    uint32_t id; uint8_t len; uint8_t buf[8];
+    if (CAN.readMsgBuf(&id, &len, buf) == CAN_OK) {
+      if (id == CAN_ID_OIL && len >= 4) {
+        // Oil: bytes 2-3 = kPa(abs)*0.1 -> gauge PSI
+        uint16_t raw = (uint16_t(buf[2]) << 8) | buf[3];
+        float kPa_abs   = raw * 0.1f;
+        float kPa_gauge = kPa_abs - 101.3f;
+        float psi       = kPa_gauge * 0.145038f;
+        static bool firstOil = true;
+        if (firstOil) { oilPsiFilt = psi; firstOil = false; }
+        else          { oilPsiFilt += SMOOTH_ALPHA * (psi - oilPsiFilt); }
+      } else if (id == CAN_ID_RPMMP && len >= 4) {
+        // RPM: 0-1; MAP ABS kPa: 2-3 -> MAP PSI (gauge)
+        rpmRaw = (uint16_t(buf[0]) << 8) | buf[1];
+        float kPa_abs   = ((uint16_t(buf[2]) << 8) | buf[3]) * 0.1f;
+        float kPa_gauge = kPa_abs - 101.3f;
+        float psi       = kPa_gauge * 0.145038f;
+        static bool firstMap = true;
+        if (firstMap) { mapPsiFilt = psi; firstMap = false; }
+        else          { mapPsiFilt += SMOOTH_ALPHA * (psi - mapPsiFilt); }
+      } else if (id == CAN_ID_LAMB && len >= 2) {
+        uint16_t raw = (uint16_t(buf[0]) << 8) | buf[1];
+        float lam = raw / 1000.0f;
+        static bool firstL = true;
+        if (firstL) { lambFilt = lam; firstL = false; }
+        else        { lambFilt += SMOOTH_ALPHA * (lam - lambFilt); }
+      }
+    }
+  }
+
+  // 2) One-button handling (debounced, short vs long)
+  bool b = digitalRead(BTN);
+  if (b != btnLast) { btnLast = b; btnChangeAt = now; }
+  else {
+    if (b == LOW && !btnPressed && (now - btnChangeAt) > DEBOUNCE_MS) {
+      btnPressed = true; btnPressAt = now;
+    }
+    if (b == HIGH && btnPressed && (now - btnChangeAt) > DEBOUNCE_MS) {
+      unsigned long held = now - btnPressAt; btnPressed = false;
+      if (held >= LONG_MS) {
+        muteUntil = now + MUTE_MS;           // long press: mute alarm
+      } else {
+        currentPage = (currentPage + 1) % NUM_PAGES;  // short press: next page
+      }
+    }
+  }
+  bool muted = (now < muteUntil);
+
+  // 3) Oil alarm with hysteresis (still computed while muted)
+  if (!alertActive && oilPsiFilt > 0.0f && oilPsiFilt < OIL_P_MIN_PSI) {
+    alertActive = true;
+  } else if (alertActive && oilPsiFilt >= OIL_P_CLEAR_PSI) {
+    alertActive = false;
+  }
+  if (alertActive && !muted && (now - lastFlashToggle) >= FLASH_INTERVAL) {
+    lastFlashToggle = now;
+    flashOn = !flashOn;
+  }
+  if (!alertActive || muted) flashOn = false;
+
+  // 4) Throttled redraw
+  if (now - lastDisplayUpdate >= DISPLAY_INTERVAL) {
+    lastDisplayUpdate = now;
+
+    // Alarm overlay on any page (just big "OIL P" in the center)
+    if (alertActive && !muted && flashOn) {
+      drawCenteredLabel("OIL PSI");  // keep label visible
+      u8x8.clearLine(3); u8x8.clearLine(4);
+      u8x8.draw2x2String(centerCol2x("OIL P"), 3, "OIL P");
+    } else {
+      // Quantize shown values for stability
+      float oilQ  = quantizeF(fmaxf(0.0f, oilPsiFilt), STEP_OIL);
+      float mapQ  = quantizeF(mapPsiFilt,               STEP_MAP);   // PSI gauge (may go negative)
+      float lamQ  = quantizeF(lambFilt,                 STEP_LAMB);
+      uint16_t rpmQ = (rpmRaw / STEP_RPM) * STEP_RPM;
+
+      // Prepare label + number
+      char label[10];
+      char num[16];
+
+      switch (currentPage) {
+        case PAGE_OIL:
+          strcpy(label, "OIL PSI");
+          if (changedF(oilQ, oilShown, STEP_OIL)) oilShown = oilQ;
+          dtostrf(oilShown, 0, 1, num);
+          break;
+
+        case PAGE_MAP:
+          strcpy(label, "MAP PSI");
+          if (changedF(mapQ, mapPsiShown, STEP_MAP)) mapPsiShown = mapQ;
+          dtostrf(mapPsiShown, 0, 1, num);
+          break;
+
+        case PAGE_LAMB:
+          strcpy(label, "LAMBDA");
+          if (changedF(lamQ, lambShown, STEP_LAMB)) lambShown = lamQ;
+          dtostrf(lambShown, 0, 2, num);
+          break;
+
+        default: // PAGE_RPM
+          strcpy(label, "RPM");
+          if (abs((int)rpmQ - (int)rpmShown) >= STEP_RPM) rpmShown = rpmQ;
+          snprintf(num, sizeof(num), "%u", rpmShown);
+          break;
+      }
+
+      // Draw centered label at top and centered 2x value in the middle
+      drawCenteredLabel(label);
+      drawCenteredValue2x(num);
+    }
+  }
+}
